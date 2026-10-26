@@ -1,0 +1,247 @@
+@page "/bracket"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using System.Globalization
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.EntityFrameworkCore
+@using BracketChallenge.Data
+@using BracketChallenge.Scoring
+@inject ApplicationDbContext Db
+@inject AuthenticationStateProvider Auth
+@inject IConfiguration Config
+
+<PageTitle>My Bracket</PageTitle>
+<h1>My Bracket</h1>
+
+<style>
+    .matchup { display: flex; gap: 8px; margin: 6px 0; }
+    .pick { padding: 6px 12px; border: 1px solid #888; border-radius: 6px; background: #f4f4f4; cursor: pointer; }
+    .pick.selected { background: #1b6ec2; color: white; border-color: #1b6ec2; }
+    .pick:disabled { cursor: default; opacity: .8; }
+</style>
+
+@if (lockUtc is not null)
+{
+    <p>Picks lock at <strong>@lockUtc.Value.ToString("ddd MMM d, h:mm tt", CultureInfo.InvariantCulture) UTC</strong>.
+       @if (IsLocked) { <strong> Picks are locked.</strong> }</p>
+}
+
+@foreach (var c in new[] { Conference.AFC, Conference.NFC })
+{
+    var conf = c;
+    var p = picks[conf];
+    var divGames = DivGames(conf);
+    var confGame = ConfGame(conf);
+
+    <h2>@conf</h2>
+
+    <h4>Wild card <small>(#1 seed has a bye)</small></h4>
+    @for (int i = 0; i < Reseeding.WildCardGames.Length; i++)
+    {
+        var idx = i;
+        var g = Reseeding.WildCardGames[idx];
+        @Matchup(conf, g.Home, g.Away, Sel(p.Wc, idx), s => PickWc(conf, idx, s))
+    }
+
+    <h4>Divisional</h4>
+    @if (divGames is null)
+    {
+        <p><em>Pick all three wild-card games first.</em></p>
+    }
+    else
+    {
+        @for (int i = 0; i < divGames.Length; i++)
+        {
+            var idx = i;
+            var g = divGames[idx];
+            @Matchup(conf, g.Home, g.Away, Sel(p.Div, idx), s => PickDiv(conf, idx, s))
+        }
+    }
+
+    <h4>@conf championship</h4>
+    @if (confGame is null)
+    {
+        <p><em>Pick both divisional games first.</em></p>
+    }
+    else
+    {
+        @Matchup(conf, confGame.Value.Home, confGame.Value.Away, picks[conf].Champ, s => PickChamp(conf, s))
+    }
+}
+
+<h2>Super Bowl</h2>
+@if (picks[Conference.AFC].Champ is int afc && picks[Conference.NFC].Champ is int nfc)
+{
+    <div class="matchup">
+        <button class="@(sbWinner == Conference.AFC ? "pick selected" : "pick")" disabled="@IsLocked"
+                @onclick="() => sbWinner = Conference.AFC">@Label(Conference.AFC, afc)</button>
+        <button class="@(sbWinner == Conference.NFC ? "pick selected" : "pick")" disabled="@IsLocked"
+                @onclick="() => sbWinner = Conference.NFC">@Label(Conference.NFC, nfc)</button>
+    </div>
+}
+else
+{
+    <p><em>Pick both conference champions first.</em></p>
+}
+
+<p>
+    <button class="pick" disabled="@IsLocked" @onclick="SaveAsync">Save bracket</button>
+</p>
+@if (message != null) { <p><em>@message</em></p> }
+
+@code {
+    class ConfPicks
+    {
+        public Dictionary<int, int> Wc = new();   // wild-card game index -> winning seed
+        public Dictionary<int, int> Div = new();  // divisional game index -> winning seed
+        public int? Champ;                        // conference champion seed
+    }
+
+    Dictionary<Conference, ConfPicks> picks = new()
+    {
+        [Conference.AFC] = new(),
+        [Conference.NFC] = new()
+    };
+    Conference? sbWinner;
+    Dictionary<(Conference, int), Team> teams = new();
+    DateTime? lockUtc;
+    string userId = "";
+    string? message;
+
+    bool IsLocked => lockUtc is not null && DateTime.UtcNow >= lockUtc;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await Auth.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
+
+        teams = (await Db.Teams.ToListAsync()).ToDictionary(t => (t.Conference, t.Seed));
+
+        if (DateTime.TryParse(Config["Bracket:LockUtc"], CultureInfo.InvariantCulture,
+                DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var d))
+            lockUtc = d;
+
+        var existing = await Db.BracketPicks.Where(x => x.Bracket!.UserId == userId).ToListAsync();
+        if (existing.Count > 0) Restore(existing);
+    }
+
+    // ---------- helpers ----------
+    string Label(Conference c, int seed) => $"#{seed} {teams[(c, seed)].Name}";
+    static int? Sel(Dictionary<int, int> d, int i) => d.TryGetValue(i, out var v) ? v : null;
+
+    (int Home, int Away)[]? DivGames(Conference c) =>
+        picks[c].Wc.Count == 3 ? Reseeding.Divisional(picks[c].Wc.Values.ToList()) : null;
+
+    (int Home, int Away)? ConfGame(Conference c) =>
+        picks[c].Div.Count == 2 ? Reseeding.ConferenceChampionship(picks[c].Div.Values.ToList()) : null;
+
+    // Drop any later-round pick that no longer makes sense after an earlier pick changed.
+    void Sanitize(Conference c)
+    {
+        var p = picks[c];
+        var games = DivGames(c);
+        foreach (var k in p.Div.Keys.ToList())
+            if (games is null || (p.Div[k] != games[k].Home && p.Div[k] != games[k].Away))
+                p.Div.Remove(k);
+
+        var cg = ConfGame(c);
+        if (p.Champ is int ch && (cg is null || (ch != cg.Value.Home && ch != cg.Value.Away)))
+            p.Champ = null;
+
+        if (sbWinner == c && p.Champ is null) sbWinner = null;
+    }
+
+    void PickWc(Conference c, int game, int seed) { if (IsLocked) return; picks[c].Wc[game] = seed; Sanitize(c); }
+    void PickDiv(Conference c, int game, int seed) { if (IsLocked) return; picks[c].Div[game] = seed; Sanitize(c); }
+    void PickChamp(Conference c, int seed) { if (IsLocked) return; picks[c].Champ = seed; Sanitize(c); }
+
+    bool IsComplete =>
+        picks.Values.All(p => p.Wc.Count == 3 && p.Div.Count == 2 && p.Champ is not null) && sbWinner is not null;
+
+    // ---------- rendering ----------
+    RenderFragment Matchup(Conference c, int home, int away, int? selected, Action<int> pick) => @<div class="matchup">
+        @foreach (var s in new[] { home, away })
+        {
+            var seed = s;
+            <button class="@(selected == seed ? "pick selected" : "pick")" disabled="@IsLocked"
+                    @onclick="() => pick(seed)">@Label(c, seed)</button>
+        }
+    </div>;
+
+    // ---------- save / load ----------
+    async Task SaveAsync()
+    {
+        if (IsLocked) { message = "Picks are locked."; return; }   // enforced here on the server
+        if (!IsComplete) { message = "Finish every pick before saving."; return; }
+
+        var bracket = await Db.Brackets.FirstOrDefaultAsync(b => b.UserId == userId);
+        if (bracket is null)
+        {
+            bracket = new Bracket { UserId = userId, SubmittedAtUtc = DateTime.UtcNow };
+            Db.Brackets.Add(bracket);
+            await Db.SaveChangesAsync();
+        }
+        else
+        {
+            bracket.SubmittedAtUtc = DateTime.UtcNow;
+            await Db.BracketPicks.Where(x => x.BracketId == bracket.Id).ExecuteDeleteAsync();
+        }
+
+        var rows = new List<BracketPick>();
+        foreach (var c in new[] { Conference.AFC, Conference.NFC })
+        {
+            var p = picks[c];
+            foreach (var seed in p.Wc.Values) rows.Add(Row(bracket.Id, Data.Round.WildCard, c, seed));
+            foreach (var seed in p.Div.Values) rows.Add(Row(bracket.Id, Data.Round.Divisional, c, seed));
+            rows.Add(Row(bracket.Id, Data.Round.Conference, c, p.Champ!.Value));
+        }
+        rows.Add(Row(bracket.Id, Data.Round.SuperBowl, sbWinner!.Value, picks[sbWinner.Value].Champ!.Value));
+
+        Db.BracketPicks.AddRange(rows);
+        await Db.SaveChangesAsync();
+        message = "Bracket saved. You can come back and change it until picks lock.";
+    }
+
+    BracketPick Row(int bracketId, Data.Round round, Conference c, int seed) =>
+        new() { BracketId = bracketId, Round = round, TeamId = teams[(c, seed)].Id };
+
+    void Restore(List<BracketPick> existing)
+    {
+        var byId = teams.Values.ToDictionary(t => t.Id);
+
+        HashSet<int> Seeds(Data.Round r, Conference c) => existing
+            .Where(x => x.Round == r).Select(x => byId[x.TeamId])
+            .Where(t => t.Conference == c).Select(t => t.Seed).ToHashSet();
+
+        foreach (var c in new[] { Conference.AFC, Conference.NFC })
+        {
+            var p = picks[c];
+            var wc = Seeds(Data.Round.WildCard, c);
+            for (int i = 0; i < Reseeding.WildCardGames.Length; i++)
+            {
+                var g = Reseeding.WildCardGames[i];
+                if (wc.Contains(g.Home)) p.Wc[i] = g.Home;
+                else if (wc.Contains(g.Away)) p.Wc[i] = g.Away;
+            }
+
+            var games = DivGames(c);
+            var div = Seeds(Data.Round.Divisional, c);
+            if (games is not null)
+                for (int i = 0; i < games.Length; i++)
+                {
+                    if (div.Contains(games[i].Home)) p.Div[i] = games[i].Home;
+                    else if (div.Contains(games[i].Away)) p.Div[i] = games[i].Away;
+                }
+
+            var cg = ConfGame(c);
+            var conf = Seeds(Data.Round.Conference, c);
+            if (cg is not null)
+                p.Champ = conf.Contains(cg.Value.Home) ? cg.Value.Home
+                        : conf.Contains(cg.Value.Away) ? cg.Value.Away : null;
+        }
+
+        var sb = existing.FirstOrDefault(x => x.Round == Data.Round.SuperBowl);
+        if (sb is not null) sbWinner = byId[sb.TeamId].Conference;
+    }
+}
