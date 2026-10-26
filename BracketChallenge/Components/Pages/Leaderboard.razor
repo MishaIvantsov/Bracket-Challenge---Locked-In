@@ -1,0 +1,173 @@
+@page "/leaderboard"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.EntityFrameworkCore
+@using BracketChallenge.Data
+@using BracketChallenge.Scoring
+@inject ApplicationDbContext Db
+@inject AuthenticationStateProvider Auth
+
+<PageTitle>Leaderboard</PageTitle>
+<h1>Leaderboard</h1>
+
+<p>
+    Your display name:
+    <input @bind="displayName" maxlength="30" placeholder="e.g. Uncle Dave" />
+    <button @onclick="SaveNameAsync">Save</button>
+</p>
+
+@if (leagues.Count == 0)
+{
+    <p>You haven't joined a league yet. Go to <a href="leagues">Leagues</a> to join one.</p>
+}
+else
+{
+    <p>
+        League:
+        <select @onchange="OnLeagueChanged">
+            @foreach (var l in leagues)
+            {
+                <option value="@l.Id" selected="@(l.Id == selectedLeagueId)">@l.Name</option>
+            }
+        </select>
+    </p>
+
+    <table class="table">
+        <thead>
+            <tr>
+                <th>#</th><th>Name</th><th>Wild card</th><th>Divisional</th>
+                <th>Conference</th><th>Champion</th><th>Total</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var r in rows)
+            {
+                <tr class="@(r.UserId == userId ? "fw-bold" : "")">
+                    <td>@r.Rank</td>
+                    <td>@r.Name @if (!r.HasBracket) { <small>(no bracket yet)</small> }</td>
+                    <td>@r.Score.WildCard</td>
+                    <td>@r.Score.Divisional</td>
+                    <td>@r.Score.Conference</td>
+                    <td>@r.Score.ChampionBonus</td>
+                    <td>@r.Score.Total</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@if (message != null) { <p><em>@message</em></p> }
+
+@code {
+    record Row(int Rank, string UserId, string Name, bool HasBracket, Score Score);
+
+    string userId = "";
+    string displayName = "";
+    string? message;
+    int selectedLeagueId;
+    List<League> leagues = [];
+    List<Row> rows = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await Auth.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
+
+        var me = await Db.Users.FirstOrDefaultAsync(u => u.Id == userId);
+        displayName = me?.DisplayName ?? "";
+
+        leagues = await Db.LeagueMembers
+            .Where(m => m.UserId == userId)
+            .Select(m => m.League!)
+            .OrderBy(l => l.Name)
+            .ToListAsync();
+
+        if (leagues.Count > 0)
+        {
+            selectedLeagueId = leagues[0].Id;
+            await LoadAsync();
+        }
+    }
+
+    async Task OnLeagueChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var id))
+        {
+            selectedLeagueId = id;
+            await LoadAsync();
+        }
+    }
+
+    async Task SaveNameAsync()
+    {
+        var name = displayName.Trim();
+        if (name.Length == 0) { message = "Enter a display name."; return; }
+
+        var me = await Db.Users.FirstAsync(u => u.Id == userId);
+        me.DisplayName = name;
+        await Db.SaveChangesAsync();
+        message = "Display name saved.";
+        await LoadAsync();
+    }
+
+    async Task LoadAsync()
+    {
+        var memberIds = await Db.LeagueMembers
+            .Where(m => m.LeagueId == selectedLeagueId)
+            .Select(m => m.UserId)
+            .ToListAsync();
+
+        var users = await Db.Users.Where(u => memberIds.Contains(u.Id)).ToListAsync();
+
+        var pickRows = await Db.BracketPicks
+            .Where(p => memberIds.Contains(p.Bracket!.UserId))
+            .Select(p => new { p.Bracket!.UserId, p.Round, p.TeamId })
+            .ToListAsync();
+        var picksByUser = pickRows.ToLookup(p => p.UserId, p => (p.Round, p.TeamId));
+
+        var resultRows = await Db.RoundResults.Select(r => new { r.Round, r.TeamId }).ToListAsync();
+        var actual = Build(resultRows.Select(r => (r.Round, r.TeamId)));
+
+        var scored = users.Select(u => new
+        {
+            u.Id,
+            Name = !string.IsNullOrWhiteSpace(u.DisplayName)
+                ? u.DisplayName
+                : (u.UserName ?? "Player").Split('@')[0],
+            HasBracket = picksByUser.Contains(u.Id),
+            Score = ScoringService.Calculate(Build(picksByUser[u.Id]), actual)
+        })
+        .OrderBy(x => x.Score, new LeaderboardComparer())
+        .ThenBy(x => x.Name)
+        .ToList();
+
+        // Players tied on total AND every tiebreaker share a rank.
+        var comparer = new LeaderboardComparer();
+        rows = [];
+        for (int i = 0; i < scored.Count; i++)
+        {
+            int rank = i > 0 && comparer.Compare(scored[i].Score, scored[i - 1].Score) == 0
+                ? rows[i - 1].Rank
+                : i + 1;
+            rows.Add(new Row(rank, scored[i].Id, scored[i].Name, scored[i].HasBracket, scored[i].Score));
+        }
+    }
+
+    // Turns (round, teamId) rows into the Picks shape ScoringService expects.
+    static Picks Build(IEnumerable<(Data.Round Round, int TeamId)> source)
+    {
+        var list = source.ToList();
+        IReadOnlySet<int> Ids(Data.Round r) =>
+            list.Where(x => x.Round == r).Select(x => x.TeamId).ToHashSet();
+
+        int? champion = list
+            .Where(x => x.Round == Data.Round.SuperBowl)
+            .Select(x => (int?)x.TeamId)
+            .FirstOrDefault();
+
+        return new Picks(Ids(Data.Round.WildCard), Ids(Data.Round.Divisional),
+                         Ids(Data.Round.Conference), champion);
+    }
+}
