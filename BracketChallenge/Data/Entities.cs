@@ -12,6 +12,13 @@ public class Team
     public string Name { get; set; } = "";
     public Conference Conference { get; set; }
     public int Seed { get; set; }
+    public int? EspnId { get; set; }
+}
+
+public class AppSetting
+{
+    public string Key { get; set; } = "";
+    public string Value { get; set; } = "";
 }
 
 // The real results: one row per team that advanced out of a round.

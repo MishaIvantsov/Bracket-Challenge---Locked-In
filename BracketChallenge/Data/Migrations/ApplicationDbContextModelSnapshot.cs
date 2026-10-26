@@ -17,6 +17,20 @@ namespace BracketChallenge.Migrations
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.14");
 
+            modelBuilder.Entity("BracketChallenge.Data.AppSetting", b =>
+                {
+                    b.Property<string>("Key")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Value")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Key");
+
+                    b.ToTable("AppSettings");
+                });
+
             modelBuilder.Entity("BracketChallenge.Data.ApplicationUser", b =>
                 {
                     b.Property<string>("Id")
@@ -198,6 +212,9 @@ namespace BracketChallenge.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<int>("Conference")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("EspnId")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("Name")

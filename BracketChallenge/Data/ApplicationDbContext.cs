@@ -12,6 +12,7 @@ public class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options
     public DbSet<BracketPick> BracketPicks => Set<BracketPick>();
     public DbSet<League> Leagues => Set<League>();
     public DbSet<LeagueMember> LeagueMembers => Set<LeagueMember>();
+    public DbSet<AppSetting> AppSettings => Set<AppSetting>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -22,6 +23,7 @@ public class ApplicationDbContext(DbContextOptions<ApplicationDbContext> options
         b.Entity<LeagueMember>().HasKey(x => new { x.LeagueId, x.UserId });
         b.Entity<BracketPick>().HasIndex(x => new { x.BracketId, x.Round, x.TeamId }).IsUnique();
         b.Entity<RoundResult>().HasIndex(x => new { x.Round, x.TeamId }).IsUnique();
+        b.Entity<AppSetting>().HasKey(x => x.Key);
 
         // Placeholder teams for testing. Replace with the real field in January.
         var teams = new List<Team>();
