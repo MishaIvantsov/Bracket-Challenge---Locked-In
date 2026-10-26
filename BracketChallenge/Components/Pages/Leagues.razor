@@ -1,0 +1,104 @@
+@page "/leagues"
+@rendermode InteractiveServer
+@attribute [Authorize]
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authorization
+@using Microsoft.EntityFrameworkCore
+@using BracketChallenge.Data
+@inject ApplicationDbContext Db
+@inject AuthenticationStateProvider Auth
+
+<PageTitle>Leagues</PageTitle>
+<h1>Leagues</h1>
+
+<h3>My leagues</h3>
+@if (myLeagues.Count == 0)
+{
+    <p>You haven't joined a league yet.</p>
+}
+else
+{
+    <ul>
+        @foreach (var l in myLeagues)
+        {
+            <li><strong>@l.Name</strong> (join code: @l.JoinCode)</li>
+        }
+    </ul>
+}
+
+<h3>Join a league</h3>
+<input @bind="joinCode" placeholder="Join code" />
+<button @onclick="JoinAsync">Join</button>
+
+<h3>Create a league</h3>
+<input @bind="newName" placeholder="League name" />
+<button @onclick="CreateAsync">Create</button>
+
+@if (message != null)
+{
+    <p><em>@message</em></p>
+}
+
+@code {
+    string joinCode = "";
+    string newName = "";
+    string? message;
+    string userId = "";
+    List<League> myLeagues = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await Auth.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
+        await LoadAsync();
+    }
+
+    async Task LoadAsync()
+    {
+        myLeagues = await Db.LeagueMembers
+            .Where(m => m.UserId == userId)
+            .Select(m => m.League!)
+            .ToListAsync();
+    }
+
+    async Task JoinAsync()
+    {
+        var code = joinCode.Trim().ToUpperInvariant();
+        var league = await Db.Leagues.FirstOrDefaultAsync(l => l.JoinCode == code);
+        if (league is null) { message = "No league with that code."; return; }
+
+        if (await Db.LeagueMembers.AnyAsync(m => m.LeagueId == league.Id && m.UserId == userId))
+        { message = $"You're already in {league.Name}."; return; }
+
+        Db.LeagueMembers.Add(new LeagueMember { LeagueId = league.Id, UserId = userId });
+        await Db.SaveChangesAsync();
+        message = $"Joined {league.Name}!";
+        joinCode = "";
+        await LoadAsync();
+    }
+
+    async Task CreateAsync()
+    {
+        if (string.IsNullOrWhiteSpace(newName)) { message = "Enter a league name."; return; }
+
+        string code;
+        do { code = NewCode(); }
+        while (await Db.Leagues.AnyAsync(l => l.JoinCode == code));
+
+        var league = new League { Name = newName.Trim(), JoinCode = code };
+        league.Members.Add(new LeagueMember { UserId = userId });
+        Db.Leagues.Add(league);
+        await Db.SaveChangesAsync();
+
+        message = $"Created {league.Name}. Share the code {code}.";
+        newName = "";
+        await LoadAsync();
+    }
+
+    static string NewCode()
+    {
+        const string chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+        return new string(Enumerable.Range(0, 6)
+            .Select(_ => chars[Random.Shared.Next(chars.Length)]).ToArray());
+    }
+}
