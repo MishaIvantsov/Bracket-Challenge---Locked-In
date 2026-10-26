@@ -12,12 +12,6 @@
 <PageTitle>Leaderboard</PageTitle>
 <h1>Leaderboard</h1>
 
-<p>
-    Your display name:
-    <input @bind="displayName" maxlength="30" placeholder="e.g. Uncle Dave" />
-    <button @onclick="SaveNameAsync">Save</button>
-</p>
-
 @if (leagues.Count == 0)
 {
     <p>You haven't joined a league yet. Go to <a href="leagues">Leagues</a> to join one.</p>
@@ -32,6 +26,7 @@ else
                 <option value="@l.Id" selected="@(l.Id == selectedLeagueId)">@l.Name</option>
             }
         </select>
+        <button @onclick="LoadAsync">Refresh</button>
     </p>
 
     <table class="table">
@@ -58,14 +53,10 @@ else
     </table>
 }
 
-@if (message != null) { <p><em>@message</em></p> }
-
 @code {
     record Row(int Rank, string UserId, string Name, bool HasBracket, Score Score);
 
     string userId = "";
-    string displayName = "";
-    string? message;
     int selectedLeagueId;
     List<League> leagues = [];
     List<Row> rows = [];
@@ -75,10 +66,7 @@ else
         var state = await Auth.GetAuthenticationStateAsync();
         userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
 
-        var me = await Db.Users.FirstOrDefaultAsync(u => u.Id == userId);
-        displayName = me?.DisplayName ?? "";
-
-        leagues = await Db.LeagueMembers
+        leagues = await Db.LeagueMembers.AsNoTracking()
             .Where(m => m.UserId == userId)
             .Select(m => m.League!)
             .OrderBy(l => l.Name)
@@ -100,34 +88,26 @@ else
         }
     }
 
-    async Task SaveNameAsync()
-    {
-        var name = displayName.Trim();
-        if (name.Length == 0) { message = "Enter a display name."; return; }
-
-        var me = await Db.Users.FirstAsync(u => u.Id == userId);
-        me.DisplayName = name;
-        await Db.SaveChangesAsync();
-        message = "Display name saved.";
-        await LoadAsync();
-    }
-
     async Task LoadAsync()
     {
-        var memberIds = await Db.LeagueMembers
+        var memberIds = await Db.LeagueMembers.AsNoTracking()
             .Where(m => m.LeagueId == selectedLeagueId)
             .Select(m => m.UserId)
             .ToListAsync();
 
-        var users = await Db.Users.Where(u => memberIds.Contains(u.Id)).ToListAsync();
+        var users = await Db.Users.AsNoTracking()
+            .Where(u => memberIds.Contains(u.Id))
+            .ToListAsync();
 
-        var pickRows = await Db.BracketPicks
+        var pickRows = await Db.BracketPicks.AsNoTracking()
             .Where(p => memberIds.Contains(p.Bracket!.UserId))
             .Select(p => new { p.Bracket!.UserId, p.Round, p.TeamId })
             .ToListAsync();
         var picksByUser = pickRows.ToLookup(p => p.UserId, p => (p.Round, p.TeamId));
 
-        var resultRows = await Db.RoundResults.Select(r => new { r.Round, r.TeamId }).ToListAsync();
+        var resultRows = await Db.RoundResults.AsNoTracking()
+            .Select(r => new { r.Round, r.TeamId })
+            .ToListAsync();
         var actual = Build(resultRows.Select(r => (r.Round, r.TeamId)));
 
         var scored = users.Select(u => new
