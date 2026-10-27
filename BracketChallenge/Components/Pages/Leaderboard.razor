@@ -8,6 +8,7 @@
 @using BracketChallenge.Scoring
 @inject ApplicationDbContext Db
 @inject AuthenticationStateProvider Auth
+@inject BracketChallenge.Data.PlayoffSyncService Sync
 
 <PageTitle>Leaderboard</PageTitle>
 <h1>Leaderboard</h1>
@@ -90,6 +91,8 @@ else
 
     async Task LoadAsync()
     {
+        await Sync.EnsureFreshAsync();
+
         var memberIds = await Db.LeagueMembers.AsNoTracking()
             .Where(m => m.LeagueId == selectedLeagueId)
             .Select(m => m.UserId)

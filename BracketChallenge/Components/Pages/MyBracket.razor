@@ -10,6 +10,7 @@
 @inject ApplicationDbContext Db
 @inject AuthenticationStateProvider Auth
 @inject IConfiguration Config
+@inject BracketChallenge.Data.PlayoffSyncService Sync
 
 <PageTitle>My Bracket</PageTitle>
 <h1>My Bracket</h1>
@@ -21,74 +22,81 @@
     .pick:disabled { cursor: default; opacity: .8; }
 </style>
 
-@if (lockUtc is not null)
+@if (!loaded)
 {
-    <p>Picks lock at <strong>@lockUtc.Value.ToString("ddd MMM d, h:mm tt", CultureInfo.InvariantCulture) UTC</strong>.
-       @if (IsLocked) { <strong> Picks are locked.</strong> }</p>
-}
-
-@foreach (var c in new[] { Conference.AFC, Conference.NFC })
-{
-    var conf = c;
-    var p = picks[conf];
-    var divGames = DivGames(conf);
-    var confGame = ConfGame(conf);
-
-    <h2>@conf</h2>
-
-    <h4>Wild card <small>(#1 seed has a bye)</small></h4>
-    @for (int i = 0; i < Reseeding.WildCardGames.Length; i++)
-    {
-        var idx = i;
-        var g = Reseeding.WildCardGames[idx];
-        @Matchup(conf, g.Home, g.Away, Sel(p.Wc, idx), s => PickWc(conf, idx, s))
-    }
-
-    <h4>Divisional</h4>
-    @if (divGames is null)
-    {
-        <p><em>Pick all three wild-card games first.</em></p>
-    }
-    else
-    {
-        @for (int i = 0; i < divGames.Length; i++)
-        {
-            var idx = i;
-            var g = divGames[idx];
-            @Matchup(conf, g.Home, g.Away, Sel(p.Div, idx), s => PickDiv(conf, idx, s))
-        }
-    }
-
-    <h4>@conf championship</h4>
-    @if (confGame is null)
-    {
-        <p><em>Pick both divisional games first.</em></p>
-    }
-    else
-    {
-        @Matchup(conf, confGame.Value.Home, confGame.Value.Away, picks[conf].Champ, s => PickChamp(conf, s))
-    }
-}
-
-<h2>Super Bowl</h2>
-@if (picks[Conference.AFC].Champ is int afc && picks[Conference.NFC].Champ is int nfc)
-{
-    <div class="matchup">
-        <button class="@(sbWinner == Conference.AFC ? "pick selected" : "pick")" disabled="@IsLocked"
-                @onclick="() => sbWinner = Conference.AFC">@Label(Conference.AFC, afc)</button>
-        <button class="@(sbWinner == Conference.NFC ? "pick selected" : "pick")" disabled="@IsLocked"
-                @onclick="() => sbWinner = Conference.NFC">@Label(Conference.NFC, nfc)</button>
-    </div>
+    <p><em>Loading...</em></p>
 }
 else
 {
-    <p><em>Pick both conference champions first.</em></p>
-}
+    @if (lockUtc is not null)
+    {
+        <p>Picks lock at <strong>@lockUtc.Value.ToString("ddd MMM d, h:mm tt", CultureInfo.InvariantCulture) UTC</strong>.
+           @if (IsLocked) { <strong> Picks are locked.</strong> }</p>
+    }
 
-<p>
-    <button class="pick" disabled="@IsLocked" @onclick="SaveAsync">Save bracket</button>
-</p>
-@if (message != null) { <p><em>@message</em></p> }
+    @foreach (var c in new[] { Conference.AFC, Conference.NFC })
+    {
+        var conf = c;
+        var p = picks[conf];
+        var divGames = DivGames(conf);
+        var confGame = ConfGame(conf);
+
+        <h2>@conf</h2>
+
+        <h4>Wild card <small>(#1 seed has a bye)</small></h4>
+        @for (int i = 0; i < Reseeding.WildCardGames.Length; i++)
+        {
+            var idx = i;
+            var g = Reseeding.WildCardGames[idx];
+            @Matchup(conf, g.Home, g.Away, Sel(p.Wc, idx), s => PickWc(conf, idx, s))
+        }
+
+        <h4>Divisional</h4>
+        @if (divGames is null)
+        {
+            <p><em>Pick all three wild-card games first.</em></p>
+        }
+        else
+        {
+            @for (int i = 0; i < divGames.Length; i++)
+            {
+                var idx = i;
+                var g = divGames[idx];
+                @Matchup(conf, g.Home, g.Away, Sel(p.Div, idx), s => PickDiv(conf, idx, s))
+            }
+        }
+
+        <h4>@conf championship</h4>
+        @if (confGame is null)
+        {
+            <p><em>Pick both divisional games first.</em></p>
+        }
+        else
+        {
+            @Matchup(conf, confGame.Value.Home, confGame.Value.Away, picks[conf].Champ, s => PickChamp(conf, s))
+        }
+    }
+
+    <h2>Super Bowl</h2>
+    @if (picks[Conference.AFC].Champ is int afc && picks[Conference.NFC].Champ is int nfc)
+    {
+        <div class="matchup">
+            <button class="@(sbWinner == Conference.AFC ? "pick selected" : "pick")" disabled="@IsLocked"
+                    @onclick="() => sbWinner = Conference.AFC">@Label(Conference.AFC, afc)</button>
+            <button class="@(sbWinner == Conference.NFC ? "pick selected" : "pick")" disabled="@IsLocked"
+                    @onclick="() => sbWinner = Conference.NFC">@Label(Conference.NFC, nfc)</button>
+        </div>
+    }
+    else
+    {
+        <p><em>Pick both conference champions first.</em></p>
+    }
+
+    <p>
+        <button class="pick" disabled="@IsLocked" @onclick="SaveAsync">Save bracket</button>
+    </p>
+    @if (message != null) { <p><em>@message</em></p> }
+}
 
 @code {
     class ConfPicks
@@ -108,26 +116,35 @@ else
     DateTime? lockUtc;
     string userId = "";
     string? message;
+    bool loaded;
 
-    bool IsLocked => lockUtc is not null && DateTime.UtcNow >= lockUtc;
+    bool IsLocked => !loaded || (lockUtc is not null && DateTime.UtcNow >= lockUtc);
 
     protected override async Task OnInitializedAsync()
     {
         var state = await Auth.GetAuthenticationStateAsync();
         userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "";
 
-        teams = (await Db.Teams.ToListAsync()).ToDictionary(t => (t.Conference, t.Seed));
+        await Sync.EnsureFreshAsync();
 
-        if (DateTime.TryParse(Config["Bracket:LockUtc"], CultureInfo.InvariantCulture,
+        teams = (await Db.Teams.AsNoTracking().ToListAsync()).ToDictionary(t => (t.Conference, t.Seed));
+
+        var lockSetting = await Db.AppSettings.AsNoTracking().FirstOrDefaultAsync(s => s.Key == "LockUtc");
+        var lockText = lockSetting?.Value ?? Config["Bracket:LockUtc"];
+        if (DateTime.TryParse(lockText, CultureInfo.InvariantCulture,
                 DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var d))
             lockUtc = d;
 
-        var existing = await Db.BracketPicks.Where(x => x.Bracket!.UserId == userId).ToListAsync();
+        var existing = await Db.BracketPicks.AsNoTracking().Where(x => x.Bracket!.UserId == userId).ToListAsync();
         if (existing.Count > 0) Restore(existing);
+
+        loaded = true;
     }
 
     // ---------- helpers ----------
-    string Label(Conference c, int seed) => $"#{seed} {teams[(c, seed)].Name}";
+    string Label(Conference c, int seed) =>
+        teams.TryGetValue((c, seed), out var t) ? $"#{seed} {t.Name}" : $"#{seed}";
+
     static int? Sel(Dictionary<int, int> d, int i) => d.TryGetValue(i, out var v) ? v : null;
 
     (int Home, int Away)[]? DivGames(Conference c) =>

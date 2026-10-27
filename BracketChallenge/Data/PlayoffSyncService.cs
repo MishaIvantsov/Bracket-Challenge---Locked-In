@@ -5,13 +5,12 @@ using Microsoft.EntityFrameworkCore;
 namespace BracketChallenge.Data;
 
 public class PlayoffSyncService(
-    ApplicationDbContext db,
+    IServiceScopeFactory scopes,
     IHttpClientFactory httpFactory,
     IConfiguration config,
     ILogger<PlayoffSyncService> log)
 {
     static readonly SemaphoreSlim Gate = new(1, 1);
-    static readonly TimeSpan MinInterval = TimeSpan.FromMinutes(10);
 
     // ESPN postseason week numbers. Week 4 is the Pro Bowl and is ignored.
     static readonly Dictionary<int, Round> Rounds = new()
@@ -26,26 +25,35 @@ public class PlayoffSyncService(
     record Game(int Week, bool Completed, DateTime StartUtc, List<Competitor> Teams);
     record StandingTeam(int EspnId, string Name, Conference Conference, int Seed);
 
-    /// Call from pages. Does nothing if another sync is running or one ran in the last 10 minutes.
+    /// Call from pages. Uses its own database scope, so a page closing can't break it.
+    /// Does nothing if another sync is running or one ran recently.
     public async Task EnsureFreshAsync()
     {
         if (!config.GetValue<bool>("Sync:Enabled", true)) return;
         if (!await Gate.WaitAsync(0)) return;
         try
         {
-            var last = await GetAsync("LastSyncUtc");
-            if (DateTime.TryParse(last, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t)
-                && DateTime.UtcNow - t < MinInterval) return;
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
-            try { await SyncAsync(); }
+            var minInterval = TimeSpan.FromMinutes(config.GetValue<int>("Sync:MinMinutes", 10));
+            var last = await GetAsync(db, "LastSyncUtc");
+            if (DateTime.TryParse(last, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var t)
+                && DateTime.UtcNow - t < minInterval) return;
+
+            try { await SyncAsync(db); }
             catch (Exception ex) { log.LogWarning(ex, "Playoff sync failed"); }
 
-            await SetAsync("LastSyncUtc", DateTime.UtcNow.ToString("O"));
+            await SetAsync(db, "LastSyncUtc", DateTime.UtcNow.ToString("O"));
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "Playoff sync could not run");
         }
         finally { Gate.Release(); }
     }
 
-    async Task SyncAsync()
+    async Task SyncAsync(ApplicationDbContext db)
     {
         var start = DateTime.Parse(config["Sync:PlayoffStart"] ?? "2027-01-05", CultureInfo.InvariantCulture);
         var season = config["Sync:Season"] ?? "2026";
@@ -61,10 +69,10 @@ public class PlayoffSyncService(
         log.LogInformation("Sync fetched {Count} playoff games ({Wc} wild card).",
             games.Count, games.Count(g => g.Week == 1));
 
-        if (await GetAsync("FieldLoaded") != "1")
-            if (!await TryLoadFieldAsync(games, season)) return;
+        if (await GetAsync(db, "FieldLoaded") != "1")
+            if (!await TryLoadFieldAsync(db, games, season)) return;
 
-        await RecordResultsAsync(games);
+        await RecordResultsAsync(db, games);
     }
 
     // ---------- scoreboard ----------
@@ -75,14 +83,28 @@ public class PlayoffSyncService(
 
         foreach (var week in Rounds.Keys)
         {
-            var url = $"site/v2/sports/football/nfl/scoreboard?seasontype=3&week={week}&year={season}";
+            var url = $"site/v2/sports/football/nfl/scoreboard?seasontype=3&week={week}&dates={season}";
+            int before = games.Count;
+            int skipped = 0;
             try
             {
                 using var doc = JsonDocument.Parse(await http.GetStringAsync(url));
-                if (!doc.RootElement.TryGetProperty("events", out var events)) continue;
+                if (!doc.RootElement.TryGetProperty("events", out var events))
+                {
+                    log.LogInformation("Week {Week}: response had no 'events'.", week);
+                    continue;
+                }
 
                 foreach (var e in events.EnumerateArray())
                 {
+                    // Skip games from another season (ESPN can return the upcoming schedule).
+                    if (e.TryGetProperty("season", out var s) && s.TryGetProperty("year", out var y)
+                        && y.GetInt32().ToString() != season)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
                     bool completed = e.GetProperty("status").GetProperty("type").GetProperty("completed").GetBoolean();
                     var startUtc = DateTime.Parse(e.GetProperty("date").GetString()!, CultureInfo.InvariantCulture,
                         DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal);
@@ -93,6 +115,13 @@ public class PlayoffSyncService(
                             c.TryGetProperty("winner", out var w) && w.ValueKind == JsonValueKind.True))
                         .ToList();
 
+                    // Skip "TBD" placeholder games (ESPN uses negative team ids for them).
+                    if (teams.Any(t => t.EspnId <= 0))
+                    {
+                        skipped++;
+                        continue;
+                    }
+
                     games.Add(new Game(week, completed, startUtc, teams));
                 }
             }
@@ -101,12 +130,14 @@ public class PlayoffSyncService(
                 // A round that isn't published yet can fail. Keep the rounds we did get.
                 log.LogInformation("Scoreboard for week {Week} unavailable: {Message}", week, ex.Message);
             }
+            log.LogInformation("Week {Week}: {Count} games ({Skipped} skipped as wrong season or TBD).",
+                week, games.Count - before, skipped);
         }
         return games;
     }
 
     // ---------- playoff field ----------
-    async Task<bool> TryLoadFieldAsync(List<Game> games, string season)
+    async Task<bool> TryLoadFieldAsync(ApplicationDbContext db, List<Game> games, string season)
     {
         var wc = games.Where(g => g.Week == 1).ToList();
         if (wc.Count != 6)                                   // field not announced yet
@@ -132,10 +163,22 @@ public class PlayoffSyncService(
         var byId = standings.ToDictionary(s => s.EspnId);
         var wcIds = wc.SelectMany(g => g.Teams.Select(t => t.EspnId)).ToHashSet();
         var expected = standings.Where(s => s.Seed >= 2).Select(s => s.EspnId).ToHashSet();
-        bool consistent = wcIds.SetEquals(expected)
-            && wc.All(g => g.Teams.Count == 2 && g.Teams.Sum(t => byId[t.EspnId].Seed) == 9);
-        if (!consistent)
+
+        var notInStandings = wcIds.Where(id => !byId.ContainsKey(id)).ToList();
+        var badGames = wc.Where(g => g.Teams.Count != 2
+                || g.Teams.Any(t => !byId.ContainsKey(t.EspnId))
+                || g.Teams.Sum(t => byId[t.EspnId].Seed) != 9).ToList();
+
+        if (!wcIds.SetEquals(expected) || notInStandings.Count > 0 || badGames.Count > 0)
         {
+            log.LogWarning("Standings seeds: {Seeds}", string.Join(", ",
+                standings.OrderBy(s => s.Conference).ThenBy(s => s.Seed)
+                         .Select(s => $"{s.Conference}{s.Seed}={s.EspnId}")));
+            log.LogWarning("Wild-card games: {Games}", string.Join(" | ", wc.Select(g =>
+                string.Join(" v ", g.Teams.Select(t => byId.TryGetValue(t.EspnId, out var s)
+                    ? $"{t.EspnId}(seed {s.Seed})" : $"{t.EspnId}(not in standings)")))));
+            log.LogWarning("In scoreboard but not seeds 2-7: {A}. In seeds 2-7 but not on scoreboard: {B}.",
+                string.Join(",", wcIds.Except(expected)), string.Join(",", expected.Except(wcIds)));
             log.LogWarning("Standings and wild-card games disagree. Field not loaded.");
             return false;
         }
@@ -149,8 +192,8 @@ public class PlayoffSyncService(
         }
         await db.SaveChangesAsync();
 
-        await SetAsync("LockUtc", wc.Min(g => g.StartUtc).ToString("O"));
-        await SetAsync("FieldLoaded", "1");
+        await SetAsync(db, "LockUtc", wc.Min(g => g.StartUtc).ToString("O"));
+        await SetAsync(db, "FieldLoaded", "1");
         log.LogInformation("Playoff field loaded.");
         return true;
     }
@@ -202,7 +245,7 @@ public class PlayoffSyncService(
     }
 
     // ---------- results ----------
-    async Task RecordResultsAsync(List<Game> games)
+    async Task RecordResultsAsync(ApplicationDbContext db, List<Game> games)
     {
         var teams = await db.Teams.Where(t => t.EspnId != null).ToDictionaryAsync(t => t.EspnId!.Value);
         var existing = (await db.RoundResults.Select(r => new { r.Round, r.TeamId }).ToListAsync())
@@ -233,10 +276,10 @@ public class PlayoffSyncService(
     }
 
     // ---------- settings ----------
-    async Task<string?> GetAsync(string key) =>
+    static async Task<string?> GetAsync(ApplicationDbContext db, string key) =>
         (await db.AppSettings.AsNoTracking().FirstOrDefaultAsync(s => s.Key == key))?.Value;
 
-    async Task SetAsync(string key, string value)
+    static async Task SetAsync(ApplicationDbContext db, string key, string value)
     {
         var row = await db.AppSettings.FindAsync(key);
         if (row is null) db.AppSettings.Add(new AppSetting { Key = key, Value = value });
